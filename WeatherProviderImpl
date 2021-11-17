@@ -1,0 +1,194 @@
+package ru.geekbrains.qa.java2.lesson8.project;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.squareup.okhttp.HttpUrl;
+import com.squareup.okhttp.OkHttpClient;
+import com.squareup.okhttp.Request;
+import com.squareup.okhttp.Response;
+import ru.geekbrains.qa.java2.lesson8.project.dto.WeatherResponse;
+import ru.geekbrains.qa.java2.lesson8.project.enums.Periods;
+import ru.geekbrains.qa.java2.lesson8.project.entity.WeatherData;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.sql.SQLException;
+import java.time.LocalDate;
+import java.time.ZonedDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class WeatherProviderImpl implements WeatherProvider {
+    private static final String BASE_HOST = "dataservice.accuweather.com";
+    private static final String FORECAST_ENDPOINT = "forecasts";
+    private static final String CURRENT_CONDITIONS_ENDPOINT = "currentconditions";
+    private static final String API_VERSION = "v1";
+    private static final String API_KEY = ApplicationGlobalState.getInstance().getApiKey();
+    private static final String FORECAST_TYPE = "daily";
+    private static final String FORECAST_PERIOD = "5day";
+    private static final String FORECAST_RESPONSE_TEMPLATE = "В городе %s на дату %s ожидается %s, температура - %s C";
+
+
+    private final OkHttpClient client = new OkHttpClient();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final DatabaseRepositorySQLiteImpl sqLite = new DatabaseRepositorySQLiteImpl();
+
+    @Override
+    public List<WeatherData> getWeather(Periods periods) throws IOException {
+        sqLite.createTableIfNotExists();
+        String cityKey = detectCityKey();
+
+        List<WeatherData> weatherDatas = new ArrayList<>();
+
+        String city = ApplicationGlobalState.getInstance().getSelectedCity();
+
+
+        switch (periods) {
+            case NOW:
+                HttpUrl url = new HttpUrl.Builder()
+                        .scheme("http")
+                        .host(BASE_HOST)
+                        .addPathSegment(CURRENT_CONDITIONS_ENDPOINT)
+                        .addPathSegment(API_VERSION)
+                        .addPathSegment(cityKey)
+                        .addQueryParameter("apikey", API_KEY)
+                        .build();
+
+                Request request = new Request.Builder()
+                        .addHeader("accept", "application/json")
+                        .url(url)
+                        .build();
+
+                Response response = client.newCall(request).execute();
+                String jsonResponse = response.body().string();
+
+
+                jsonResponse = jsonResponse.substring(1, jsonResponse.length() - 1);
+
+                WeatherResponse weatherResponse = objectMapper.readValue(jsonResponse, WeatherResponse.class);
+
+                String text = weatherResponse.getWeatherText();
+                String date = weatherResponse.getLocalObservationDateTime();
+                Double temperatureC = weatherResponse.getTemperature().getMetric().getValue();
+
+                WeatherData weatherData = new WeatherData(city, date, text, temperatureC);
+
+                weatherDatas.add(weatherData);
+
+                System.out.println(String.format(FORECAST_RESPONSE_TEMPLATE, city, date, text, temperatureC));
+
+                break;
+
+            case FIVE_DAYS:
+                url = new HttpUrl.Builder()
+                        .scheme("http")
+                        .host(BASE_HOST)
+                        .addPathSegment(FORECAST_ENDPOINT)
+                        .addPathSegment(API_VERSION)
+                        .addPathSegment(FORECAST_TYPE)
+                        .addPathSegment(FORECAST_PERIOD)
+                        .addPathSegment(cityKey)
+                        .addQueryParameter("apikey", API_KEY)
+                        .addQueryParameter("metric", "true")
+                        .build();
+
+                request = new Request.Builder()
+                        .addHeader("accept", "application/json")
+                        .url(url)
+                        .build();
+
+                response = client.newCall(request).execute();
+                jsonResponse = response.body().string();
+
+                JsonNode daysForecast = objectMapper.readTree(jsonResponse).at("/DailyForecasts");
+
+                for (int i = 0; i < 5; i++) {
+                    date = daysForecast.get(i).at("/Date").asText();
+
+                    String minTempText = daysForecast.get(i).at("/Temperature/Minimum/Value").asText();
+                    String maxTempText = daysForecast.get(i).at("/Temperature/Maximum/Value").asText();
+
+                    // формула вычисления среднего значения
+                    BigDecimal temp = new BigDecimal(minTempText).add(new BigDecimal(maxTempText)).divide(new BigDecimal(2));
+
+                    text = daysForecast.get(i).at("/Day/IconPhrase").asText();
+
+                    weatherData = new WeatherData(city, date, text, temp.doubleValue());
+
+                    weatherDatas.add(weatherData);
+
+                    System.out.println(String.format(FORECAST_RESPONSE_TEMPLATE, city, date, text, temp));
+                }
+
+                break;
+        }
+
+        for (WeatherData weatherData : weatherDatas) {
+            try {
+                sqLite.saveWeatherData(weatherData);
+            } catch (SQLException e) {
+                e.printStackTrace();
+            }
+        }
+
+        return weatherDatas;
+    }
+
+    @Override
+    public List<WeatherData> getAllFromDb() {
+        try {
+            List<WeatherData> weatherDatas = sqLite.getAllSavedData();
+
+            for (WeatherData weatherData : weatherDatas) {
+                System.out.println(String.format(FORECAST_RESPONSE_TEMPLATE, weatherData.getCity(), weatherData.getLocalDate(), weatherData.getText(), weatherData.getTemperature()));
+            }
+
+            return weatherDatas;
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+
+        return Collections.emptyList();
+    }
+
+
+    private String detectCityKey() throws IOException {
+        String selectedCity = ApplicationGlobalState.getInstance().getSelectedCity();
+
+        HttpUrl detectLocationURL = new HttpUrl.Builder()
+                .scheme("http")
+                .host(BASE_HOST)
+                .addPathSegment("locations")
+                .addPathSegment(API_VERSION)
+                .addPathSegment("cities")
+                .addPathSegment("autocomplete")
+                .addQueryParameter("apikey", API_KEY)
+                .addQueryParameter("q", selectedCity)
+                .build();
+
+        Request request = new Request.Builder()
+                .addHeader("accept", "application/json")
+                .url(detectLocationURL)
+                .build();
+
+        Response response = client.newCall(request).execute();
+
+        if (!response.isSuccessful()) {
+            throw new IOException("Невозможно прочесть информацию о городе. " +
+                    "Код ответа сервера = " + response.code() + " тело ответа = " + response.body().string());
+        }
+        String jsonResponse = response.body().string();
+        System.out.println("Произвожу поиск города " + selectedCity);
+
+        if (objectMapper.readTree(jsonResponse).size() > 0) {
+            String cityName = objectMapper.readTree(jsonResponse).get(0).at("/LocalizedName").asText();
+            String countryName = objectMapper.readTree(jsonResponse).get(0).at("/Country/LocalizedName").asText();
+            System.out.println("Найден город " + cityName + " в стране " + countryName);
+        } else throw new IOException("Server returns 0 cities");
+
+        return objectMapper.readTree(jsonResponse).get(0).at("/Key").asText();
+    }
+
+
+}
