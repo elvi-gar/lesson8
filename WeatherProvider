@@ -1,0 +1,13 @@
+package ru.geekbrains.qa.java2.lesson8.project;
+
+import ru.geekbrains.qa.java2.lesson8.project.enums.Periods;
+import ru.geekbrains.qa.java2.lesson8.project.entity.WeatherData;
+
+import java.io.IOException;
+import java.util.List;
+
+public interface WeatherProvider {
+    List<WeatherData> getWeather(Periods periods) throws IOException;
+
+    List<WeatherData> getAllFromDb() throws IOException;
+}
